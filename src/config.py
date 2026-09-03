@@ -30,6 +30,8 @@ ENV_DEFAULTS: dict[str, str] = {
     "RSS_FILE": "sample/2026-09-03_tech_rss.json",
     "OUTPUT_DIR": "output",
     "THREAD_ID": "news-blog",
+    "HOTSPOTS_FILE": "sample/2026-09-03_news_hotspots.json",
+    "HOTSPOT_THREAD_ID": "news-hotspots",
     "LANGSMITH_API_KEY": "",
     "LANGSMITH_PROJECT": "",
 }
@@ -58,6 +60,8 @@ class Settings:
     rss_file: Path
     output_dir: Path
     thread_id: str
+    hotspots_file: Path
+    hotspot_thread_id: str
     langsmith_api_key: str
     langsmith_project: str | None
 
@@ -133,6 +137,8 @@ def load_settings() -> Settings:
         rss_file=_resolve_project_path(_env_str("RSS_FILE")),
         output_dir=_resolve_project_path(_env_str("OUTPUT_DIR")),
         thread_id=_env_str("THREAD_ID"),
+        hotspots_file=_resolve_project_path(_env_str("HOTSPOTS_FILE")),
+        hotspot_thread_id=_env_str("HOTSPOT_THREAD_ID"),
         langsmith_api_key=langsmith_api_key,
         langsmith_project=langsmith_project or None,
     )

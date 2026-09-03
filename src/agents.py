@@ -18,8 +18,13 @@ from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, ValidationError
 
 from src.config import PROJECT_ROOT, Settings
-from src.models import SelectionResult
-from src.prompts import MAIN_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT
+from src.models import BlogSelectionResult, HotspotSelectionResult
+from src.prompts import (
+    HOTSPOT_WRITER_SYSTEM_PROMPT,
+    WRITER_SYSTEM_PROMPT,
+    hotspot_main_system_prompt,
+    main_system_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +59,10 @@ def _make_chat_model(settings: Settings, *, writer: bool) -> BaseChatModel:
     )
 
 
-def build_main_agent(settings: Settings, writer_tools: Sequence[BaseTool]):
-    """创建 1 主 Agent（选题、结构化输出）+ 1 写作 SubAgent。"""
+def build_main_agent(
+    settings: Settings, writer_tools: Sequence[BaseTool], count: int = 1
+):
+    """创建 1 主 Agent（选题、结构化输出）+ 1 写作 SubAgent；count 为要选的主题数。"""
     writer_spec: dict[str, Any] = {
         "name": "writer",
         "description": (
@@ -69,12 +76,37 @@ def build_main_agent(settings: Settings, writer_tools: Sequence[BaseTool]):
     return create_deep_agent(
         name="news-selector",
         model=_make_chat_model(settings, writer=False),
-        system_prompt=MAIN_SYSTEM_PROMPT,
+        system_prompt=main_system_prompt(count),
         backend=FilesystemBackend(root_dir=PROJECT_ROOT, virtual_mode=True),
         checkpointer=MemorySaver(),
         subagents=[writer_spec],
         # 注意：本地小模型对 response_format（结构化输出工具）支持不稳定，
         # 选题结论改为由提示词约束最终消息输出 JSON，代码层校验+重试（见 run_selection）。
+    )
+
+
+def build_hotspot_agent(
+    settings: Settings, writer_tools: Sequence[BaseTool], count: int = 2
+):
+    """创建热点主 Agent（选 count 则 + 结构化输出）+ 热点写作 SubAgent。"""
+    writer_spec: dict[str, Any] = {
+        "name": "hotspot_writer",
+        "description": (
+            "把主编选定的一则热点新闻写成中文热点解读摘要 md；"
+            "有原文链接时用 web_fetch 抓取总结，无链接时用 web_search 搜索总结；"
+            "拥有 web_fetch/web_search/resolve_output_path/write_file 工具，负责联网取材并落盘 Markdown。"
+        ),
+        "model": _make_chat_model(settings, writer=True),
+        "system_prompt": HOTSPOT_WRITER_SYSTEM_PROMPT,
+        "tools": list(writer_tools),
+    }
+    return create_deep_agent(
+        name="hotspot-selector",
+        model=_make_chat_model(settings, writer=False),
+        system_prompt=hotspot_main_system_prompt(count),
+        backend=FilesystemBackend(root_dir=PROJECT_ROOT, virtual_mode=True),
+        checkpointer=MemorySaver(),
+        subagents=[writer_spec],
     )
 
 
@@ -129,76 +161,154 @@ def _parse_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _validate_selection(raw: Any) -> tuple[SelectionResult | None, str | None]:
+def _validate_selection(
+    raw: Any, model_cls: type[BaseModel] = BlogSelectionResult
+) -> tuple[BaseModel | None, str | None]:
     try:
-        if isinstance(raw, SelectionResult):
+        if isinstance(raw, model_cls):
             return raw, None
         if isinstance(raw, BaseModel):
             raw = raw.model_dump()
-        selection = SelectionResult.model_validate(raw)
+        selection = model_cls.model_validate(raw)
         return selection, None
     except (ValidationError, TypeError, ValueError) as exc:
         return None, str(exc)
 
 
-def _extract_selection(state: Mapping[str, Any]) -> tuple[SelectionResult | None, list[str]]:
+def check_pick_count(selection: BaseModel, expected: int) -> str | None:
+    """校验结论中的 picks 数量与期望值一致；一致或模型无 picks 字段时返回 None。"""
+    picks = getattr(selection, "picks", None)
+    if not isinstance(picks, list):
+        return None
+    if len(picks) != expected:
+        return f"picks 数量 {len(picks)} 与要求 {expected} 不一致"
+    return None
+
+
+def _extract_selection(
+    state: Mapping[str, Any],
+    model_cls: type[BaseModel] = BlogSelectionResult,
+    expected_count: int | None = None,
+) -> tuple[BaseModel | None, list[str]]:
     errors: list[str] = []
     structured = state.get("structured_response")
     if structured is not None:
-        selection, error = _validate_selection(structured)
+        selection, error = _validate_selection(structured, model_cls)
         if selection is not None:
-            return selection, errors
-        errors.append(f"structured_response 校验失败：{error}")
+            count_error = (
+                check_pick_count(selection, expected_count)
+                if expected_count is not None
+                else None
+            )
+            if count_error is None:
+                return selection, errors
+            errors.append(f"structured_response {count_error}")
+        else:
+            errors.append(f"structured_response 校验失败：{error}")
 
     for text in _iter_json_texts(state):
         obj = _parse_json_object(text)
         if obj is None:
             continue
-        selection, error = _validate_selection(obj)
+        selection, error = _validate_selection(obj, model_cls)
         if selection is not None:
-            return selection, errors
-        if error:
+            count_error = (
+                check_pick_count(selection, expected_count)
+                if expected_count is not None
+                else None
+            )
+            if count_error is None:
+                return selection, errors
+            errors.append(count_error)
+        elif error:
             errors.append(error)
     return None, errors
 
 
-def _retry_prompt(errors: list[str]) -> str:
+def _retry_prompt(errors: list[str], *, hotspot: bool = False, count: int = 1) -> str:
     detail = "；".join(errors[:3]) if errors else "最终 JSON 缺失"
+    if hotspot:
+        return (
+            "你上次的最终输出没有通过选稿结论校验（错误：" + detail + "）。"
+            "请基于同一候选继续主线流程：若 hotspot_writer 尚未全部确认写入文件，"
+            "先调用 task（subagent_type='hotspot_writer'）委托或催办；"
+            "若都已完成，不要重复调用或写文件。"
+            "你的最后一条消息必须【只包含一个 JSON 对象】，不要 Markdown 代码块、不要解释文字，格式："
+            "{\"picks\": [{\"topic_title\": \"...\", \"link\": \"...\", \"source\": \"...\", "
+            "\"published_at\": \"...\", \"selection_reason\": \"...\"}, {...}]}，"
+            f"picks 恰好 {count} 个，topic_title/link/source/published_at 照抄候选列表。"
+        )
     return (
         "你上次的最终输出没有通过选题结论校验（错误：" + detail + "）。"
-        "请基于同一候选继续主线流程：若尚未确认 writer 已写入文件，请先调用 task（subagent_type='writer'）"
-        "委托或催办写作；若 writer 已完成，不要重复调用或写文件。"
-        "你的最后一条消息必须【只包含一个 JSON 对象】，不要 Markdown 代码块、不要解释文字，字段："
-        "topic_title/link/source/published_at/selection_reason/outline"
-        "（outline 为 5-8 项的字符串数组，topic_title/link/source/published_at 照抄候选列表）。"
+        "请基于同一候选继续主线流程：若 writer 尚未全部确认写入文件，"
+        "请先调用 task（subagent_type='writer'）委托或催办写作；"
+        "若都已完成，不要重复调用或写文件。"
+        "你的最后一条消息必须【只包含一个 JSON 对象】，不要 Markdown 代码块、不要解释文字，格式："
+        "{\"picks\": [{\"topic_title\": \"...\", \"link\": \"...\", \"source\": \"...\", "
+        "\"published_at\": \"...\", \"selection_reason\": \"...\", "
+        "\"outline\": [\"...\", \"...\"]}, {...}]}，"
+        f"picks 恰好 {count} 个，outline 为 5-8 项的字符串数组，"
+        "topic_title/link/source/published_at 照抄候选列表。"
     )
 
 
-def run_selection(agent, user_prompt: str, thread_id: str) -> tuple[Mapping[str, Any], SelectionResult]:
-    """运行主 Agent（含委派 writer），并对 SelectionResult 解析失败重试一次。"""
+def run_selection(
+    agent, user_prompt: str, thread_id: str, count: int = 1
+) -> tuple[Mapping[str, Any], BlogSelectionResult]:
+    """运行主 Agent（含委派 writer），并对 BlogSelectionResult 解析失败重试一次。"""
     config = {"configurable": {"thread_id": thread_id}}
-    logger.info("启动主 Agent：选题 -> task(writer) -> 结构化输出……")
+    logger.info("启动主 Agent：选 %d 题 -> task(writer) x%d -> 结构化输出……", count, count)
     state = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]}, config=config)
 
-    selection, errors = _extract_selection(state)
+    selection, errors = _extract_selection(state, BlogSelectionResult, count)
     if selection is not None:
-        return state, selection
+        return state, selection  # type: ignore[return-value]
 
-    logger.warning("主 Agent 输出未通过 SelectionResult 校验，按 FR1 重试一次。")
+    logger.warning("主 Agent 输出未通过 BlogSelectionResult 校验，按 FR1 重试一次。")
     state = agent.invoke(
-        {"messages": [{"role": "user", "content": _retry_prompt(errors)}]},
+        {"messages": [{"role": "user", "content": _retry_prompt(errors, count=count)}]},
         config=config,
     )
-    selection, retry_errors = _extract_selection(state)
+    selection, retry_errors = _extract_selection(state, BlogSelectionResult, count)
     if selection is not None:
-        return state, selection
+        return state, selection  # type: ignore[return-value]
 
-    all_errors = (errors + retry_errors) or ["两次均未返回 SelectionResult"]
+    all_errors = (errors + retry_errors) or ["两次均未返回 BlogSelectionResult"]
     _dump_transcript(state, selection=None)
-    raise RuntimeError("两次尝试均未获得合法 SelectionResult：" + "；".join(all_errors[:5]))
+    raise RuntimeError("两次尝试均未获得合法 BlogSelectionResult：" + "；".join(all_errors[:5]))
 
 
-def _dump_transcript(state: Mapping[str, Any], selection: SelectionResult | None) -> Path:
+def run_hotspot_selection(
+    agent, user_prompt: str, thread_id: str, count: int = 2
+) -> tuple[Mapping[str, Any], HotspotSelectionResult]:
+    """运行热点主 Agent（含 count 次委派 hotspot_writer），并重试一次。"""
+    config = {"configurable": {"thread_id": thread_id}}
+    logger.info("启动热点主 Agent：选 %d 则 -> task(hotspot_writer) x%d -> 结构化输出……", count, count)
+    state = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]}, config=config)
+
+    selection, errors = _extract_selection(state, HotspotSelectionResult, count)
+    if selection is not None:
+        return state, selection  # type: ignore[return-value]
+
+    logger.warning("热点主 Agent 输出未通过 HotspotSelectionResult 校验，重试一次。")
+    state = agent.invoke(
+        {
+            "messages": [
+                {"role": "user", "content": _retry_prompt(errors, hotspot=True, count=count)}
+            ]
+        },
+        config=config,
+    )
+    selection, retry_errors = _extract_selection(state, HotspotSelectionResult, count)
+    if selection is not None:
+        return state, selection  # type: ignore[return-value]
+
+    all_errors = (errors + retry_errors) or ["两次均未返回 HotspotSelectionResult"]
+    _dump_transcript(state, selection=None)
+    raise RuntimeError("两次尝试均未获得合法 HotspotSelectionResult：" + "；".join(all_errors[:5]))
+
+
+def _dump_transcript(state: Mapping[str, Any], selection: BaseModel | None) -> Path:
     """把主 Agent 的消息记录转储到 output/debug_transcript.txt，便于排查本地模型输出。"""
     target = PROJECT_ROOT / "output" / "debug_transcript.txt"
     target.parent.mkdir(parents=True, exist_ok=True)

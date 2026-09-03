@@ -7,10 +7,12 @@ import re
 from datetime import date
 from pathlib import Path
 
-from src.models import NewsItem, RssData
+from src.models import HotspotData, NewsItem, RssData
 
 SUMMARY_LIMIT = 200
 TOP_N = 30
+HOTSPOT_PER_SOURCE = 5
+HOTSPOT_TOP_N = 24
 
 _HN_POINTS_RE = re.compile(r"Points:\s*([\d,]+)", re.IGNORECASE)
 _HN_COMMENTS_RE = re.compile(r"#?\s*Comments:\s*([\d,]+)", re.IGNORECASE)
@@ -73,8 +75,8 @@ def _extract_item(index: int, item: dict) -> NewsItem:
     )
 
 
-def load_rss(rss_file: Path) -> RssData:
-    """加载 RSS JSON 并返回预处理后的 top-30 候选与 prompt。"""
+def load_rss(rss_file: Path, count: int = 1) -> RssData:
+    """加载 RSS JSON 并返回预处理后的 top-30 候选与 prompt；count 为要选的主题数。"""
     if not rss_file.is_file():
         raise FileNotFoundError(f"RSS 文件不存在：{rss_file}")
     try:
@@ -106,9 +108,74 @@ def load_rss(rss_file: Path) -> RssData:
         lines.append(f"{rank}. {item.to_candidate()}")
         lines.append("")
     lines.append(
-        "最后提醒（务必遵守）：确认 writer 已写入文件后，你的最后一条回复必须只包含一个 "
-        "JSON 对象（字段 topic_title/link/source/published_at/selection_reason/outline，"
-        "outline 为 5-8 项字符串数组，topic_title/link/source/published_at 照抄候选列表对应条目），"
-        "不要输出 Markdown 代码块或任何解释文字。"
+        f"最后提醒（务必遵守）：确认全部 writer 都已写入文件后，你的最后一条回复必须只包含一个 "
+        f"JSON 对象：{{\"picks\": [{{\"topic_title\": \"...\", \"link\": \"...\", \"source\": \"...\", "
+        f"\"published_at\": \"...\", \"selection_reason\": \"...\", \"outline\": [\"...\"]}}, {{...}}]}}，"
+        f"picks 必须恰好 {count} 个，outline 为 5-8 项字符串数组，"
+        f"topic_title/link/source/published_at 照抄候选列表对应条目，"
+        f"不要输出 Markdown 代码块或任何解释文字。"
     )
     return RssData(date=rss_date, top_items=top_items, prompt="\n".join(lines))
+
+
+def _load_items_payload(data_file: Path, label: str) -> tuple[str, list[dict]]:
+    """加载 sources/sources[].items 结构的 JSON，返回 (date, 全部原始条目)。"""
+    if not data_file.is_file():
+        raise FileNotFoundError(f"{label}文件不存在：{data_file}")
+    try:
+        with data_file.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        raise ValueError(f"{label} JSON 解析失败（{data_file}）：{exc}") from exc
+
+    try:
+        sources = payload["sources"]
+        raw_items = [
+            item
+            for source in sources
+            for item in (source.get("items") or [])
+        ]
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"{label} JSON 缺少顶层 sources/sources[].items 结构") from exc
+
+    data_date = str(payload.get("date") or date.today().isoformat())
+    return data_date, raw_items
+
+
+def load_hotspots(hotspots_file: Path, count: int = 2) -> HotspotData:
+    """加载热点新闻 JSON，按来源限流（每源至多 HOTSPOT_PER_SOURCE 条）取 top 候选；
+    count 为要选的新闻数。"""
+    hotspots_date, raw_items = _load_items_payload(hotspots_file, "热点")
+
+    items: list[NewsItem] = []
+    per_source_count: dict[str, int] = {}
+    for idx, raw in enumerate(raw_items):
+        item = _extract_item(idx, raw)
+        if not item.title:
+            continue
+        source_count = per_source_count.get(item.source, 0)
+        if source_count >= HOTSPOT_PER_SOURCE:
+            continue
+        per_source_count[item.source] = source_count + 1
+        items.append(item)
+        if len(items) >= HOTSPOT_TOP_N:
+            break
+
+    lines = [f"今日热点日期：{hotspots_date}"]
+    lines.append(
+        f"候选共 {len(items)} 条（每来源至多 {HOTSPOT_PER_SOURCE} 条、"
+        f"合计至多 {HOTSPOT_TOP_N} 条；link 为空的条目无原文链接，writer 需用搜索补素材）："
+    )
+    lines.append("")
+    for rank, item in enumerate(items, start=1):
+        lines.append(f"{rank}. {item.to_candidate()}")
+        lines.append("")
+    lines.append(
+        f"最后提醒（务必遵守）：确认全部 hotspot_writer 都已写入文件后，你的最后一条回复必须只包含一个 "
+        f"JSON 对象：{{\"picks\": [{{\"topic_title\": \"...\", \"link\": \"...\", \"source\": \"...\", "
+        f"\"published_at\": \"...\", \"selection_reason\": \"...\"}}, {{...}}]}}，"
+        f"picks 必须恰好 {count} 个，"
+        f"topic_title/link/source/published_at 照抄候选列表对应条目（link 可为空字符串），"
+        f"不要输出 Markdown 代码块或任何解释文字。"
+    )
+    return HotspotData(date=hotspots_date, items=items, prompt="\n".join(lines))

@@ -1,7 +1,7 @@
 [project]
 name = "news-auto-agent"
 version = "0.1.0"
-description = "news-auto-agent: 每日科技 RSS 自动选题并生成中文技术博客"
+description = "news-auto-agent: 每日科技 RSS 自动选题生成中文技术博客；热点新闻选 2 则生成热点解读"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

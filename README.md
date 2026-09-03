@@ -1,13 +1,30 @@
 # news-auto-agent
 
-每日科技 RSS 自动选题并生成中文技术博客的 Deep Agents 应用：主 Agent 从 RSS 候选中选定一个主题，委派写作 SubAgent 联网取材并落盘 Markdown 文章。
+每日科技新闻 Deep Agents 应用，包含两条流水线：
+
+- **RSS 博客 Agent**（`--type tech`）：主 Agent 从 RSS 候选中选定 `count` 个主题，各委派写作 SubAgent 联网取材并落盘一篇中文技术博客。
+- **热点解读 Agent**（`--type news`）：主 Agent 从热点新闻文件中选出最有价值的 `count` 则新闻，各委派一次写作 SubAgent 生成一篇中文热点解读。
+
+```bash
+uv run cli.py --type tech --count 1   # 技术博客：选 1 题 -> 1 篇博客
+uv run cli.py --type news --count 2   # 热点解读：选 2 则 -> 2 篇解读
+```
 
 ## 工作流程
 
-1. 读取 RSS 聚合文件（`RSS_FILE`），预处理为候选列表。
-2. 主 Agent（选题模型）选定主题并输出结构化选题结论（JSON，含大纲）。
+RSS 博客 Agent：
+
+1. 读取 RSS 聚合文件（`--file` 或 `RSS_FILE`），预处理为候选列表。
+2. 主 Agent（选题模型）选定 `count` 个主题并输出结构化选题结论（JSON，每个主题含大纲）。
 3. 写作 SubAgent（写作模型）使用 `web_search` / `web_fetch` 联网取材，通过 `resolve_output_path` 规划路径并写入 `OUTPUT_DIR`。
 4. 代码层兜底：强制 `<date>-` 文件名前缀；联网工具全部不可用时在文章中补降级警告与参考链接。
+
+热点解读 Agent：
+
+1. 读取热点新闻文件（`--file` 或 `HOTSPOTS_FILE`），按来源限流（每来源至多 5 条、合计 top-24）生成候选列表。
+2. 主 Agent（选题模型）选出恰好 `count` 则最有价值的热点新闻（时效性、影响力、AI/科技相关性、大众关注度）。
+3. 对每个选题分别委托 `hotspot_writer` 写作 SubAgent：有原文链接用 `web_fetch` 抓取后总结，无链接或抓取失败用 `web_search` 搜索补充，产出热点解读 Markdown。
+4. 主 Agent 输出结构化选稿结论（`{"picks": [...]}`，数量必须等于 `count`，不符自动重试一次）；代码层兜底与 RSS 博客 Agent 相同（日期前缀、frontmatter、联网降级标记）。
 
 ## 环境要求
 
@@ -29,13 +46,20 @@ uv sync
 cp .env.example .env   # Windows: copy .env.example .env
 # 编辑 .env，按需填写 OLLAMA_API_KEY / DEEPSEEK_API_KEY 等
 
-# 3. 确认 RSS 输入文件存在（默认 sample/2026-09-03_tech_rss.json，可用 RSS_FILE 修改）
+# 3. 确认输入文件存在（默认 RSS：sample/2026-09-03_tech_rss.json，热点：sample/2026-09-03_news_hotspots.json，
+#    可用 --file 或 RSS_FILE / HOTSPOTS_FILE 修改）
 
-# 4. 运行
-uv run main.py
+# 4. 运行（统一 CLI）
+uv run cli.py --type tech --count 1              # 技术博客：选 1 题 -> 1 篇博客
+uv run cli.py --type news --count 2              # 热点解读：选 2 则 -> 2 篇热点解读
+uv run cli.py --type 新闻 --file sample/2026-09-03_news_hotspots.json --count 3
+
+# main.py / main_hotspots.py 仍可用，等价于上面前两条命令
 ```
 
-运行成功后，终端打印选题结论与文章路径，文章写入 `output/<rss日期>_<主题slug>.md`（重名自动追加 `-2`、`-3`）。退出码：0 成功，1 失败（错误日志见终端输出；选题解析失败时对话记录转储到 `output/debug_transcript.txt`）。
+`--type` 支持别名：`tech`/`技术`/`blog`，`news`/`新闻`/`热点`；`--count` 缺省为 tech=1、news=2；`--file` 缺省取 `RSS_FILE` / `HOTSPOTS_FILE`。
+
+运行成功后，终端打印选题结论与文章路径，文章写入 `output/<date>-<主题slug>.md`（重名自动追加 `-2`、`-3`）。退出码：0 成功，1 失败（错误日志见终端输出；选题解析失败时对话记录转储到 `output/debug_transcript.txt`）。writer 产出不足 `--count` 个文件即报错退出。
 
 ## 配置说明（.env）
 
@@ -50,29 +74,37 @@ uv run main.py
 | `SELECT_TEMPERATURE` / `WRITE_TEMPERATURE` | `0.2` / `0.7` | 选题 / 写作温度 |
 | `NUM_PREDICT` | `4096` | 写作最大生成 token 数 |
 | `RSS_FILE` | `sample/2026-09-03_tech_rss.json` | RSS 聚合文件（相对项目根目录） |
+| `HOTSPOTS_FILE` | `sample/2026-09-03_news_hotspots.json` | 热点新闻文件（热点 Agent 输入，相对项目根目录） |
 | `OUTPUT_DIR` | `output` | 博客输出目录 |
 | `THREAD_ID` | `news-blog` | deepagents thread_id |
+| `HOTSPOT_THREAD_ID` | `news-hotspots` | 热点 Agent 的 deepagents thread_id |
 | `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` | 空 | 有值则启用 LangSmith 追踪 |
 
 ## 项目结构
 
 ```
-main.py            # 入口：配置加载 -> RSS 预处理 -> Agent 运行 -> 兜底与报告
+cli.py             # 统一 CLI：--type tech|news --file <json> --count N
+main.py            # 等价于 cli.py --type tech --count 1
+main_hotspots.py   # 等价于 cli.py --type news --count 2
 src/
   config.py        # .env 加载与默认值（Settings）
-  preprocess.py    # RSS 聚合文件加载与候选预处理
-  agents.py        # Deep Agents 主 Agent / 写作 SubAgent 构建、选题解析与重试
+  preprocess.py    # RSS / 热点文件加载与候选预处理（load_rss / load_hotspots）
+  agents.py        # Deep Agents 主 Agent / 写作 SubAgent 构建、结论解析、数量校验与重试
   tools.py         # web_search / web_fetch / resolve_output_path 工具
-  prompts.py       # 主 Agent 与写作 SubAgent 系统提示词
-  models.py        # 选题结论等数据模型
+  prompts.py       # 主 Agent 与写作 SubAgent 系统提示词（博客 / 热点两套，按 count 生成）
+  models.py        # 选题结论、热点选稿等数据模型（picks 数量由运行层 count 校验）
   output.py        # 输出路径规划、文件名兜底、降级标记
-sample/            # RSS 示例输入
-output/            # 生成的博客文章
+sample/            # RSS / 热点示例输入
+output/            # 生成的博客文章与热点解读
+tests/             # pytest 测试（联网类测试需本地 Ollama 在线）
 ```
 
 ## 常见问题
 
 - **`pull model manifest: 404`**：本地没有拉取配置的模型，执行 `ollama pull <SELECT_MODEL/WRITE_MODEL>`。
 - **联网搜索失败/降级**：检查 `OLLAMA_API_KEY` 是否有效（ollama.com/settings/keys 生成），或确认本机 Ollama 应用已登录账号。降级触发时文章会带降级警告行，运行日志有 WARNING。
-- **两次尝试均未获得合法 SelectionResult**：本地小模型输出不稳定，查看 `output/debug_transcript.txt` 排查；可换更大模型或调低 `SELECT_TEMPERATURE`。
+- **两次尝试均未获得合法 BlogSelectionResult / HotspotSelectionResult**：本地小模型输出不稳定，查看 `output/debug_transcript.txt` 排查；可换更大模型或调低 `SELECT_TEMPERATURE`。
+- **picks 数量与要求 N 不一致**：主 Agent 返回的选稿数与 `--count` 不符（重试一次后仍不符则退出），可调低 `--count` 或换更大选题模型。
+- **`writer 应产出 N 个 Markdown 文件，实际找到 M 个`**：写作 SubAgent 未全部落盘，查看上文 WARNING 日志与 `output/debug_transcript.txt`。
 - **`DEEPSEEK_API_KEY 未设置`**：任一 provider 设为 `deepseek` 时必须填写。
+- **运行测试**：`PYTHONPATH=. uv run pytest tests/`（联网类测试需本地 Ollama 在线）。

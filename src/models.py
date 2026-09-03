@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 
-class SelectionResult(BaseModel):
-    """主 Agent 的结构化选题结论（FR1）。"""
+class TopicPick(BaseModel):
+    """博客选题：主 Agent 从 RSS 候选中选出的单个主题。"""
 
     topic_title: str = Field(..., description="选中条目的标题")
     link: str = Field(..., description="原文链接")
@@ -21,6 +21,28 @@ class SelectionResult(BaseModel):
         max_length=8,
         description="文章大纲，5-8 个要点",
     )
+
+
+class BlogSelectionResult(BaseModel):
+    """主 Agent 的结构化选题结论：picks 数量由运行时 count 决定（FR1）。"""
+
+    picks: list[TopicPick] = Field(..., min_length=1)
+
+
+class HotspotPick(BaseModel):
+    """热点选稿：主 Agent 从候选中选出的单则新闻。"""
+
+    topic_title: str = Field(..., description="选中条目的标题")
+    link: str = Field(..., description="原文链接，可能为空字符串（无原文链接）")
+    source: str = Field(..., description="来源名称")
+    published_at: str = Field(..., description="发布时间")
+    selection_reason: str = Field(..., description="选稿理由")
+
+
+class HotspotSelectionResult(BaseModel):
+    """热点主 Agent 的结构化选稿结论：picks 数量由运行时 count 决定。"""
+
+    picks: list[HotspotPick] = Field(..., min_length=1)
 
 
 @dataclass(frozen=True)
@@ -56,4 +78,13 @@ class RssData:
 
     date: str
     top_items: list[NewsItem]
+    prompt: str
+
+
+@dataclass(frozen=True)
+class HotspotData:
+    """热点新闻预处理结果。"""
+
+    date: str
+    items: list[NewsItem]
     prompt: str
