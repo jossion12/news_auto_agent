@@ -97,6 +97,11 @@ $RECYCLE.BIN/
 # 每日跑批生成的产物目录（如果将来需要跟踪，删除这一段）
 # output/
 
+# 每日跑批的输入快照（仅保留最初的样例文件）
+sample/*
+!sample/2026-09-03_news_hotspots.json
+!sample/2026-09-03_tech_rss.json
+
 # ─── Misc ─────────────────────────────────────────────────
 *.bak
 *.swp

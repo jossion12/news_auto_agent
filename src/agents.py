@@ -19,6 +19,7 @@ from pydantic import BaseModel, ValidationError
 
 from src.config import PROJECT_ROOT, Settings
 from src.models import BlogSelectionResult, HotspotSelectionResult
+from src.usage import UsageTracker
 from src.prompts import (
     HOTSPOT_WRITER_SYSTEM_PROMPT,
     WRITER_SYSTEM_PROMPT,
@@ -107,6 +108,49 @@ def build_hotspot_agent(
         backend=FilesystemBackend(root_dir=PROJECT_ROOT, virtual_mode=True),
         checkpointer=MemorySaver(),
         subagents=[writer_spec],
+    )
+
+
+def build_writer_agent(
+    settings: Settings, writer_tools: Sequence[BaseTool], *, hotspot: bool = False
+):
+    """独立写作 Agent：只跑 writer，不经过 DeepSeek 主 Agent，省掉选题后的多轮往返。"""
+    return create_deep_agent(
+        name="hotspot_writer" if hotspot else "writer",
+        model=_make_chat_model(settings, writer=True),
+        system_prompt=HOTSPOT_WRITER_SYSTEM_PROMPT if hotspot else WRITER_SYSTEM_PROMPT,
+        tools=list(writer_tools),
+        backend=FilesystemBackend(root_dir=PROJECT_ROOT, virtual_mode=True),
+        checkpointer=MemorySaver(),
+    )
+
+
+def run_writer(
+    agent,
+    pick: Any,
+    item: Any,
+    *,
+    hotspot: bool = False,
+    thread_id: str = "writer",
+) -> None:
+    """把一条选题直接交给写作 Agent（省去 DeepSeek 主 Agent 的 task 往返）。"""
+    lines = [
+        f"【选题】{getattr(pick, 'topic_title', '')}",
+        f"【原文链接】{getattr(pick, 'link', '') or '（无）'}",
+        f"【来源】{getattr(pick, 'source', '')}",
+        f"【发布时间】{getattr(pick, 'published_at', '')}",
+        f"【RSS 摘要】{(getattr(item, 'summary', '') if item is not None else '') or '（无）'}",
+        f"【选稿理由】{getattr(pick, 'selection_reason', '')}",
+    ]
+    outline = getattr(pick, "outline", None)
+    if outline:
+        lines.append("【大纲】")
+        lines.extend(f"- {point}" for point in outline)
+    lines.append("请按你的写作规范完成，并落盘到 output 目录（先调用 resolve_output_path，再调 write_file）。")
+
+    agent.invoke(
+        {"messages": [{"role": "user", "content": "\n".join(lines)}]},
+        config={"configurable": {"thread_id": thread_id}},
     )
 
 
@@ -256,9 +300,11 @@ def run_selection(
     agent, user_prompt: str, thread_id: str, count: int = 1
 ) -> tuple[Mapping[str, Any], BlogSelectionResult]:
     """运行主 Agent（含委派 writer），并对 BlogSelectionResult 解析失败重试一次。"""
-    config = {"configurable": {"thread_id": thread_id}}
+    tracker = UsageTracker()
+    config = {"configurable": {"thread_id": thread_id}, "callbacks": [tracker]}
     logger.info("启动主 Agent：选 %d 题 -> task(writer) x%d -> 结构化输出……", count, count)
     state = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]}, config=config)
+    tracker.log("tech-selection")
 
     selection, errors = _extract_selection(state, BlogSelectionResult, count)
     if selection is not None:
@@ -282,9 +328,11 @@ def run_hotspot_selection(
     agent, user_prompt: str, thread_id: str, count: int = 2
 ) -> tuple[Mapping[str, Any], HotspotSelectionResult]:
     """运行热点主 Agent（含 count 次委派 hotspot_writer），并重试一次。"""
-    config = {"configurable": {"thread_id": thread_id}}
+    tracker = UsageTracker()
+    config = {"configurable": {"thread_id": thread_id}, "callbacks": [tracker]}
     logger.info("启动热点主 Agent：选 %d 则 -> task(hotspot_writer) x%d -> 结构化输出……", count, count)
     state = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]}, config=config)
+    tracker.log("hotspot-selection")
 
     selection, errors = _extract_selection(state, HotspotSelectionResult, count)
     if selection is not None:

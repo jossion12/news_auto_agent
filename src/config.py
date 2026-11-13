@@ -16,7 +16,7 @@ ENV_DEFAULTS: dict[str, str] = {
     "OLLAMA_BASE_URL": "http://localhost:11434",
     "OLLAMA_API_KEY": "",
     "SELECT_MODEL": "qwen3.5:9b",
-    "WRITE_MODEL": "qwen3.6:27b",
+    "WRITE_MODEL": "qwen3.8:latest",
     "SELECT_PROVIDER": "ollama",
     "WRITE_PROVIDER": "ollama",
     "DEEPSEEK_API_KEY": "",

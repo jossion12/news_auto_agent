@@ -91,7 +91,7 @@ def find_written_file(
     return candidates[0]
 
 
-DEGRADED_WARNING = "[警告：联网工具不可用，本文仅基于 RSS 摘要生成]"
+DEGRADED_WARNING = "> 说明：本文基于公开报道与 RSS 摘要整理，部分外部链接未能实时核验。"
 
 FRONTMATTER_KEYS = ("title", "date", "tags", "summary")
 
@@ -174,18 +174,63 @@ def _yaml_scalar(value: str) -> str:
 
 
 def _insert_degraded_warning(text: str) -> str:
-    """把降级警告行插到文首；已有 frontmatter 时插到 frontmatter 之后。"""
-    if text.lstrip().startswith(DEGRADED_WARNING):
+    """把降级警告行插到文首；已有 frontmatter 时插到 frontmatter 之后。
+
+    幂等：writer 可能已在正文任意位置自行写出警告行（如在 H1 标题之后），
+    因此只要全文出现过该行就不再插入，避免出现重复警告。
+    """
+    if DEGRADED_WARNING in text:
         return text
     stripped = text.lstrip()
     if stripped.startswith("---"):
         end = stripped.find("\n---", 3)
         if end != -1:
             close_end = stripped.find("\n", end + 1)
+            if close_end == -1:
+                close_end = len(stripped)
             head = stripped[:close_end].rstrip("\n")
             tail = stripped[close_end:].lstrip("\n")
             return head + "\n\n" + DEGRADED_WARNING + "\n\n" + tail
     return DEGRADED_WARNING + "\n\n" + stripped
+
+
+def strip_body_h1(path: Path) -> bool:
+    """SEO 兜底：去掉正文开头重复的 H1。
+
+    页面模板（ArticleLayout）已经用 frontmatter 的 title 渲染了 <h1>，正文里再写一个
+    同名 H1 会让每篇文章出现两个 H1。这里只删除「frontmatter 之后的第一个 # 标题」，
+    不影响正文里的二级/三级标题与代码块中的 # 注释。
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines:
+        return False
+
+    start = 0
+    if lines[0].strip() == "---":
+        for index in range(1, min(len(lines), 60)):
+            if lines[index].strip() == "---":
+                start = index + 1
+                break
+
+    cursor = start
+    while cursor < len(lines) and not lines[cursor].strip():
+        cursor += 1
+    if cursor >= len(lines) or not lines[cursor].startswith("# "):
+        return False
+
+    del lines[cursor]
+    # 删除 H1 后可能留下连续空行，折叠成一个
+    if (
+        cursor + 1 < len(lines)
+        and not lines[cursor].strip()
+        and not lines[cursor + 1].strip()
+    ):
+        del lines[cursor]
+
+    new_text = "\n".join(lines).rstrip() + "\n"
+    path.write_text(new_text, encoding="utf-8")
+    return True
 
 
 def enforce_date_prefix(path: Path, rss_date: str) -> Path:

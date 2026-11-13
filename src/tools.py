@@ -1,15 +1,23 @@
-"""LangChain tool：Ollama web_search / web_fetch 包装 + 输出路径规划。"""
+"""LangChain tool：本地 web_search / web_fetch + 输出路径规划。
+
+联网取材已从 ollama.com 的 web_search/web_fetch 切换到本地
+SearXNG + Crawl4AI 封装层（见 `src/local_web.py`）：
+- 默认 `http://127.0.0.1:8000`，docker 容器由 cli.py 自动启停
+- 返回结构与原 Ollama 工具一致（results[].title/url/content、title/content/links），
+  因此 prompts 里的取材策略不用改
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
-import httpx
 from langchain.tools import tool
 
+from src import local_web
 from src.config import Settings
 from src.output import build_output_path
 
@@ -18,7 +26,8 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_RESULT_CHARS = 4000
 _TRUNCATION_MARKER = "\n...[结果已截断]"
 MAX_SEARCH_RESULTS = 10  # 官方文档：max_results 最大 10
-_FALLBACK_TIMEOUT = 60.0
+# SDK 直连 ollama.com 的读写超时：不设超时时，网络中断会让请求永久挂起
+_SDK_TIMEOUT = 90.0
 
 
 def _serialize_result(data: Any) -> str:
@@ -33,15 +42,8 @@ def _serialize_result(data: Any) -> str:
 
 
 def _create_ollama_client(settings: Settings):
-    """创建带认证的 Ollama 客户端。
-
-    参考: https://github.com/ollama/ollama-python/blob/main/examples/web-search.py
-
-    注意事项:
-    - web_search/web_fetch 必须使用 Bearer token 认证
-    - OLLAMA_API_KEY 来自 .env 文件
-    """
-    from ollama import Client  # 延迟导入，避免模块顶部循环依赖
+    """创建带认证的 Ollama 客户端（仅作可选兜底，默认不走）。"""
+    from ollama import Client  # 延迟导入
 
     headers: dict[str, str] = {}
     if settings.ollama_api_key:
@@ -50,97 +52,111 @@ def _create_ollama_client(settings: Settings):
     return Client(
         host=settings.ollama_base_url,
         headers=headers if headers else None,
+        timeout=_SDK_TIMEOUT,
     )
 
 
-def _experimental_fallback(base_url: str, endpoint: str, payload: dict) -> dict:
-    """调用本地 Ollama 服务的 /api/experimental 端点（使用本机已登录的 Ollama 账号）。
+def _ollama_fallback_enabled() -> bool:
+    """OLLAMA 云端联网兜底：默认关闭（额度已用完）。
 
-    注意：此降级机制已过时，仅作向后兼容保留。
-    新代码建议直接使用 ollama.Client + Bearer token。
+    需要时在 .env 设 WEB_TOOLS_OLLAMA_FALLBACK=1。
     """
-    response = httpx.post(
-        f"{base_url.rstrip('/')}/api/experimental/{endpoint}",
-        json=payload,
-        timeout=_FALLBACK_TIMEOUT,
+    return os.getenv("WEB_TOOLS_OLLAMA_FALLBACK", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
-    response.raise_for_status()
-    return response.json()
+
+
+def _ollama_search(settings: Settings, query: str, max_results: int) -> Any:
+    client = _create_ollama_client(settings)
+    try:
+        return client.web_search(query=query, max_results=max_results)
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+def _ollama_fetch(settings: Settings, url: str) -> Any:
+    client = _create_ollama_client(settings)
+    try:
+        return client.web_fetch(url=url)
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
 
 
 def make_web_tools(settings: Settings, web_state: dict | None = None):
-    """把 ollama 包的 web_search/web_fetch 包装为两个 LangChain tool。
-
-    优先走官方 Python SDK（Bearer key 直连 ollama.com，见
-    https://docs.ollama.com/capabilities/web-search）；失败时降级到本地 Ollama
-    服务的 /api/experimental 端点（依赖本机已登录的 Ollama 账号）。
+    """把本地联网服务包装为两个 LangChain tool。
 
     web_state（可选）：{"ok": bool, "failures": int}，由调用方传入以追踪联网可用性，
     用于运行后按 FR3 在代码层补齐降级标记（警告行/参考链接）。
-
-    用法示例（参考 tests/test_ollama_web_tools.py）:
-        client = _create_ollama_client(settings)
-        response = client.web_search(query="python", max_results=3)
-        response = client.web_fetch(url="https://example.com")
     """
-    client = _create_ollama_client(settings)
-    base_url = settings.ollama_base_url
 
     @tool
     def web_search(query: str, max_results: int = 3) -> str:
-        """联网搜索（Ollama web search）。
+        """联网搜索（本地 SearXNG）。
 
-        返回 JSON 字符串，单次 <=4000 字符；失败时返回以 [web_search 失败] 开头的提示。
+        返回 JSON 字符串（results[].title/url/content），单次 <=4000 字符；
+        失败时返回以 [web_search 失败] 开头的提示。
 
         示例:
-            client.web_search(query="python programming", max_results=5)
-
-        返回结构 (WebSearchResponse):
-            - results: List[SearchResult]，每个包含 title, url, content
+            web_search(query="RAG 检索增强生成", max_results=5)
         """
         max_results = max(1, min(max_results, MAX_SEARCH_RESULTS))
         try:
-            result = client.web_search(query=query, max_results=max_results)
+            result = local_web.search(query, max_results)
         except Exception as exc:  # noqa: BLE001 - 按 FR3 统一降级
-            logger.warning("web_search SDK 调用失败（原因：%s），尝试本地服务端点", exc)
-            try:
-                result = _experimental_fallback(
-                    base_url, "web_search", {"query": query, "max_results": max_results}
-                )
-            except Exception as fb_exc:  # noqa: BLE001
-                logger.warning("web_search 本地服务端点也失败（原因：%s）", fb_exc)
+            logger.warning("web_search 本地服务失败（原因：%s）", exc)
+            if _ollama_fallback_enabled():
+                try:
+                    logger.info("web_search 尝试 Ollama 云端兜底")
+                    result = _ollama_search(settings, query, max_results)
+                except Exception as fb_exc:  # noqa: BLE001
+                    logger.warning("web_search Ollama 兜底也失败（原因：%s）", fb_exc)
+                    if web_state is not None:
+                        web_state["failures"] = int(web_state.get("failures", 0)) + 1
+                    return f"[web_search 失败: {type(fb_exc).__name__}: {fb_exc}]"
+            else:
                 if web_state is not None:
                     web_state["failures"] = int(web_state.get("failures", 0)) + 1
                 return f"[web_search 失败: {type(exc).__name__}: {exc}]"
+
         if web_state is not None:
             web_state["ok"] = True
         return _serialize_result(result)
 
     @tool
     def web_fetch(url: str) -> str:
-        """抓取网页正文（Ollama web fetch）。
+        """抓取网页正文（本地 Crawl4AI，支持 JS 渲染页）。
 
-        返回 JSON 字符串，单次 <=4000 字符；失败时返回以 [web_fetch 失败] 开头的提示。
+        返回 JSON 字符串（title/content/links），单次 <=4000 字符；
+        失败时返回以 [web_fetch 失败] 开头的提示。
 
         示例:
-            client.web_fetch(url="https://example.com")
-
-        返回结构 (WebFetchResponse):
-            - title: str
-            - content: str（网页正文）
-            - links: List[str]（可选，提取的链接）
+            web_fetch(url="https://example.com/article")
         """
         try:
-            result = client.web_fetch(url=url)
+            result = local_web.fetch(url)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("web_fetch SDK 调用失败（原因：%s），尝试本地服务端点", exc)
-            try:
-                result = _experimental_fallback(base_url, "web_fetch", {"url": url})
-            except Exception as fb_exc:  # noqa: BLE001
-                logger.warning("web_fetch 本地服务端点也失败（原因：%s）", fb_exc)
+            logger.warning("web_fetch 本地服务失败（原因：%s）", exc)
+            if _ollama_fallback_enabled():
+                try:
+                    logger.info("web_fetch 尝试 Ollama 云端兜底")
+                    result = _ollama_fetch(settings, url)
+                except Exception as fb_exc:  # noqa: BLE001
+                    logger.warning("web_fetch Ollama 兜底也失败（原因：%s）", fb_exc)
+                    if web_state is not None:
+                        web_state["failures"] = int(web_state.get("failures", 0)) + 1
+                    return f"[web_fetch 失败: {type(fb_exc).__name__}: {fb_exc}]"
+            else:
                 if web_state is not None:
                     web_state["failures"] = int(web_state.get("failures", 0)) + 1
                 return f"[web_fetch 失败: {type(exc).__name__}: {exc}]"
+
         if web_state is not None:
             web_state["ok"] = True
         return _serialize_result(result)

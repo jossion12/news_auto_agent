@@ -20,11 +20,11 @@ main.py
         ├── 基于候选列表按 热度 × 普适性 × 可展开性 评分，选 1 个主题
         ├── 输出结构化选题结论（SelectionResult Pydantic schema，见 §3 FR1）
         └── 通过内置 task 工具委派写作 SubAgent（WRITE_MODEL）
-              ├── web_search / web_fetch 联网补充素材（Ollama web search）
+              ├── web_search / web_fetch 联网补充素材（本地 SearXNG + Crawl4AI）
               └── write_file 落盘 Markdown 博客
 ```
 
-两个 Agent 均使用本地 Ollama 模型，通过 `langchain-ollama` 的 `ChatOllama` 接入。模型名以本机 `ollama list` 实际存在的 tag 为准（当前为 `qwen3.5:9b`、`qwen3.6:27b`），通过 `.env` 配置。
+两个 Agent 均使用本地 Ollama 模型，通过 `langchain-ollama` 的 `ChatOllama` 接入。模型名以本机 `ollama list` 实际存在的 tag 为准（当前为 `qwen3.5:9b`、`qwen3.8:latest`），通过 `.env` 配置。
 
 预处理必须在代码层完成：原始 JSON 约 100KB（>32k token），不能整文件喂给模型。
 
@@ -61,9 +61,9 @@ main.py
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | 本地 Ollama 地址 |
-| `OLLAMA_API_KEY` | 空 | ollama.com 账号 API key，由 `ollama` 包读取用于 `web_search`/`web_fetch`；为空时联网工具调用会失败，按 FR3 降级策略处理 |
+| `LOCAL_WEB_BASE_URL` | `http://127.0.0.1:8000` | 本地联网封装层（SearXNG + Crawl4AI），`web_search`/`web_fetch` 都打这里 |`r`n| `LOCAL_WEB_COMPOSE_FILE` | searxng-crawl4ai compose 路径 | 供 `cli.py` 自动 `docker compose up -d` / `stop` |`r`n| `LOCAL_WEB_AUTOSTART` | `1` | 1=自动启停容器；0=直接用现有服务 |
 | `SELECT_MODEL` | `qwen3.5:9b` | 选题 Agent 模型（`SELECT_PROVIDER=ollama` 时生效） |
-| `WRITE_MODEL` | `qwen3.6:27b` | 写作 SubAgent 模型（`WRITE_PROVIDER=ollama` 时生效） |
+| `WRITE_MODEL` | `qwen3.8:latest` | 写作 SubAgent 模型（`WRITE_PROVIDER=ollama` 时生效） |
 | `SELECT_PROVIDER` / `WRITE_PROVIDER` | `ollama` | 模型提供商，可选 `ollama`（本地）或 `deepseek`（OpenAI 兼容 API），两个 Agent 可独立配置 |
 | `DEEPSEEK_API_KEY` | 空 | 任一 provider 为 `deepseek` 时必填 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek API 地址 |
@@ -82,8 +82,8 @@ main.py
 ## 5. 技术要点与依赖
 
 - 依赖（写入 `pyproject.toml`）：`deepagents`、`langchain`（>=1.0,<2.0）、`langchain-core`（>=1.0,<2.0）、`langsmith`（>=0.3.0）、`langchain-ollama`、`langchain-openai`（DeepSeek 等 OpenAI 兼容 API）、`ollama`、`python-dotenv`。
-- 模型提供商可配置（`SELECT_PROVIDER` / `WRITE_PROVIDER`）：`ollama` 走本地 `ChatOllama`；`deepseek` 走 `ChatOpenAI`（base_url 指向 DeepSeek 的 OpenAI 兼容端点）。联网搜索工具仍由 Ollama 提供，与 LLM 提供商无关，`OLLAMA_API_KEY` 独立配置。
-- `ollama` 包的 `web_search` / `web_fetch` 包装为 LangChain tool：包装函数须把返回的 Pydantic 对象序列化为字符串（截断至合理长度，单条 ≤4000 字符）再返回。
+- 模型提供商可配置（`SELECT_PROVIDER` / `WRITE_PROVIDER`）：`ollama` 走本地 `ChatOllama`；`deepseek` 走 `ChatOpenAI`（base_url 指向 DeepSeek 的 OpenAI 兼容端点）。联网搜索与抓取由本地 SearXNG + Crawl4AI 封装层提供（`LOCAL_WEB_*`），与 LLM 提供商无关；`cli.py` 在运行前后自动启停 docker 容器。
+- 本地封装层的 `/api/web_search`、`/api/web_fetch`（与 Ollama 同形）包装为 LangChain tool：返回值序列化为字符串（截断至 ≤4000 字符）；失败返回 `[web_search 失败]` / `[web_fetch 失败]` 前缀，由 FR3 兜底。
 - 主 Agent 配置 `FilesystemBackend(root_dir=PROJECT_ROOT, virtual_mode=True)` 与 `MemorySaver` checkpointer，`thread_id` 取 `THREAD_ID`。
 - **路径基准**：所有相对路径（`RSS_FILE`、`OUTPUT_DIR`、`FilesystemBackend.root_dir`）均以项目根目录（`main.py` 所在目录，`Path(__file__).parent` 解析）为基准解析，不依赖运行时的 cwd。
 - 代码组织：入口 `main.py`，agent 与工具定义放 `src/` 下的模块（用 `uv` 脚本方式运行，无需打包配置；`main.py` 直接 import `src` 下模块或用 flat 包结构，由实施者按 uv 惯例处理）。
@@ -92,6 +92,6 @@ main.py
 ## 6. 验收标准
 
 1. `uv run main.py` 可端到端跑通，生成 `output/2026-09-03-<slug>.md`，内容满足 §3 文章质量 checklist（含字数、章节、参考链接逐条核对）。
-2. 缺少 `OLLAMA_API_KEY` 时程序不崩溃：web 工具调用失败被捕获，按 FR3 降级策略继续生成（若 RSS 摘要可用），stdout 打印 warning。
+2. 本地联网服务不可用（Docker 未启动/容器异常）时程序不崩溃：web 工具调用失败被捕获，按 FR3 降级策略继续生成（若 RSS 摘要可用），stdout 打印 warning。
 3. `.env` 不存在时使用内置默认值，行为与有 `.env` 时一致。
 4. `RSS_FILE` 指向不存在的文件时，程序清晰报错并以非零退出码退出。

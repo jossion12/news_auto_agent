@@ -60,15 +60,15 @@ class NewsItem:
     category: str = ""
 
     def to_candidate(self) -> str:
-        """渲染成供主 Agent 阅读的紧凑候选（约 400 字符/条）。"""
-        title = self.title.strip()[:160] or "(无标题)"
+        """渲染成供选题模型阅读的紧凑候选（约 300 字符/条，摘要已在预处理阶段截断）。"""
+        title = self.title.strip()[:120] or "(无标题)"
         heat = f"Points={self.hn_points or 'N/A'}, Comments={self.hn_comments or 'N/A'}"
         return (
             f"标题: {title}\n"
             f"链接: {self.link.strip()[:140]}\n"
-            f"来源: {self.source} | 发布: {self.published_at.strip()[:60]}\n"
+            f"来源: {self.source} | 发布: {self.published_at.strip()[:40]}\n"
             f"热度: {heat}\n"
-            f"摘要: {self.summary[:200]}"
+            f"摘要: {self.summary[:120]}"
         )
 
 
