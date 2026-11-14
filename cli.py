@@ -317,6 +317,13 @@ def run_pipeline(kind: str, data_file: Path, count: int) -> int:
     return 0
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows 控制台默认 GBK，打印报告时遇到 ö/・ 等字符会 UnicodeEncodeError，
+    # 导致文章已生成却以退出码 1 结束。保留原编码，仅把不可编码字符替换掉。
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (ValueError, OSError):  # 非交互流（如管道）不支持时忽略
+            pass
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stdout,
